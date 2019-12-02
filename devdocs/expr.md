@@ -1,3 +1,15 @@
+Considerations when writing function:
+make sure to return pointer, so that properties can be set, and we get a consistent PNGroup through the pipeline (if applicable)
+consider whether the function is GR, IA, a transparant or opaque aggregation. because those require special options. see https://github.com/grafana/metrictank/issues/926#issuecomment-559596384
+make sure to do the right things wrt getting slicepools, adding them to the cache for cleanup, not modifying tags, etc. (see below re memory management)
+
+
+MDP-optimization:
+* MDP at the root 0 means don't optimize, set it to >0 means, can be optimized. (based on whether request came from graphite)
+* as the context flows from root through the processing functions to the data requests, if we hit a GR function, we set to MDP to 0 on the context (and thus also on any subsequent requests)
+
+Pre-normalization:
+as we traverse down tree: transparant aggregations set PNGroups, and opaque aggregation functions and IA-functions reset them again
 ## Management of point slices
 
 The `models.Series` type, even when passed by value, has a few fields that need special attention:

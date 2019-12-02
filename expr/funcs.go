@@ -7,9 +7,11 @@ import (
 
 // Context describes a series timeframe and consolidator
 type Context struct {
-	from   uint32
-	to     uint32
-	consol consolidation.Consolidator // can be 0 to mean undefined
+	from    uint32
+	to      uint32
+	consol  consolidation.Consolidator // can be 0 to mean undefined
+	PNGroup PNGroup                    // pre-normalization group. if the data can be safely pre-normalized
+	MDP     uint32                     // maxdatapoints, if we can safely subject Reqs in this context to MDP-optimization
 }
 
 // GraphiteFunc defines a graphite processing function
