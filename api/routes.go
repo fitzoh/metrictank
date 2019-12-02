@@ -4,7 +4,6 @@ import (
 	"github.com/go-macaron/binding"
 	"github.com/grafana/metrictank/api/middleware"
 	"github.com/grafana/metrictank/api/models"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/raintank/gziper"
 	"gopkg.in/macaron.v1"
 )
@@ -75,11 +74,4 @@ func (s *Server) RegisterRoutes() {
 	r.Post("/metaTags/upsert", withOrg, ready, bind(models.MetaTagRecordUpsert{}), s.metaTagRecordUpsert)
 	r.Post("/metaTags/swap", withOrg, ready, bind(models.MetaTagRecordSwap{}), s.metaTagRecordSwap)
 	r.Get("/metaTags", withOrg, ready, s.getMetaTagRecords)
-
-	// Prometheus endpoints
-	r.Combo("/prometheus/api/v1/query_range", cBody, withOrg, ready, form(models.PrometheusRangeQuery{})).Get(s.prometheusQueryRange).Post(s.prometheusQueryRange)
-	r.Combo("/prometheus/api/v1/query", cBody, withOrg, ready, form(models.PrometheusQueryInstant{})).Get(s.prometheusQueryInstant).Post(s.prometheusQueryInstant)
-	r.Combo("/prometheus/api/v1/series", cBody, withOrg, ready, form(models.PrometheusSeriesQuery{})).Get(s.prometheusQuerySeries).Post(s.prometheusQuerySeries)
-	r.Get("/prometheus/api/v1/label/:name/values", cBody, withOrg, ready, s.prometheusLabelValues)
-	r.Get("/prometheus/metrics", promhttp.Handler())
 }

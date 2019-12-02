@@ -68,10 +68,6 @@ func (s *Server) BindTracer(tracer opentracing.Tracer) {
 	s.Tracer = tracer
 }
 
-func (s *Server) BindPromQueryEngine() {
-	s.PromQueryEngine = promql.NewEngine(s, nil)
-}
-
 type PrioritySetter interface {
 	ExplainPriority() interface{}
 }
