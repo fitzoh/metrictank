@@ -131,13 +131,13 @@ func (c *CasIdx) loadMetaRecords() {
 		}
 	}
 
+	c.sessionLock.RUnlock()
+
 	var err error
 	if err = iter.Close(); err != nil {
 		log.Errorf("Error when loading batches of meta records: %s", err.Error())
-		c.sessionLock.RUnlock()
 		return
 	}
-	c.sessionLock.RUnlock()
 
 	for orgId, batchId := range toLoad {
 		log.Infof("cassandra-idx: Loading meta record batch %s of org %d", batchId.String(), orgId)
@@ -165,12 +165,12 @@ func (c *CasIdx) loadMetaRecords() {
 			records = append(records, record)
 		}
 
+		c.sessionLock.RUnlock()
+
 		if err = iter.Close(); err != nil {
 			log.Errorf("Error when reading meta records: %s", err.Error())
-			c.sessionLock.RUnlock()
 			continue
 		}
-		c.sessionLock.RUnlock()
 
 		if err = c.MemoryIndex.MetaTagRecordSwap(orgId, records); err != nil {
 			log.Errorf("Error when swapping batch of meta records: %s", err.Error())
