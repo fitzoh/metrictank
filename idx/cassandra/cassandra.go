@@ -257,8 +257,11 @@ func (c *CasIdx) Init() error {
 		}
 	}
 
-	c.wg.Add(1)
-	go c.deadConnectionCheck()
+	if c.Config.ConnectionCheckInterval > 0 {
+		log.Infof("cassandra_store: dead connection check enabled with an interval of %v", c.Config.ConnectionCheckInterval)
+		c.wg.Add(1)
+		go c.deadConnectionCheck()
+	}
 
 	return nil
 }
@@ -629,14 +632,14 @@ func (c *CasIdx) deadConnectionCheck() {
 	defer c.wg.Done()
 
 	ticker := time.NewTicker(time.Second * 5)
-	attempts := 0
-	totaltime := 0
+	var totaltime time.Duration
 	var err error
+	var oldSession *gocql.Session
 
 OUTER:
 	for {
-		// connection to cassandra has been down for at least 30 seconds
-		if attempts >= 6 {
+		// connection to cassandra has been down for longer than the configured timeout
+		if totaltime >= c.Config.ConnectionCheckTimeout {
 			c.sessionLock.Lock()
 			for {
 				select {
@@ -650,23 +653,24 @@ OUTER:
 					return
 				default:
 					log.Errorf("cassandra-idx: creating new session to cassandra using hosts: %v", c.Config.Hosts)
-					if c.Session != nil && !c.Session.Closed() {
-						c.Session.Close()
-						c.Session = nil
+					if c.Session != nil && !c.Session.Closed() && oldSession == nil {
+						oldSession = c.Session
 					}
 					c.Session, err = c.cluster.CreateSession()
 					if err != nil {
-						log.Errorf("cassandra-idx: error while attempting to recreate cassandra session. will retry after 5 seconds: %v", err)
-						time.Sleep(time.Second * 5)
-						totaltime += 5
-						attempts++
+						log.Errorf("cassandra-idx: error while attempting to recreate cassandra session. will retry after %v: %v", c.Config.ConnectionCheckInterval.String(), err)
+						time.Sleep(c.Config.ConnectionCheckInterval)
+						totaltime += c.Config.ConnectionCheckInterval
 						// continue inner loop to attempt to reconnect
 						continue
 					}
 					c.sessionLock.Unlock()
-					log.Errorf("cassandra-idx: reconnecting to cassandra took %d seconds", totaltime)
+					log.Errorf("cassandra-idx: reconnecting to cassandra took %v", (totaltime - c.Config.ConnectionCheckTimeout).String())
 					totaltime = 0
-					attempts = 0
+					if oldSession != nil {
+						oldSession.Close()
+						oldSession = nil
+					}
 					// we connected, so go back to the normal outer loop
 					continue OUTER
 				}
@@ -685,10 +689,10 @@ OUTER:
 			// this query should work on all cassandra deployments, but we may need to revisit this
 			err = c.Session.Query("SELECT cql_version FROM system.local").Exec()
 			if err == nil {
-				attempts = 0
+				totaltime = 0
 			} else {
-				attempts++
-				log.Errorf("cassandra-idx: could not execute connection check query for %d attempts: %v", attempts, err)
+				totaltime += c.Config.ConnectionCheckInterval
+				log.Errorf("cassandra-idx: could not execute connection check query for %v: %v", totaltime.String(), err)
 			}
 			c.sessionLock.RUnlock()
 		}
