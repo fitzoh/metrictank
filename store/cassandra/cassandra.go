@@ -78,9 +78,8 @@ type ChunkReadRequest struct {
 }
 
 type CassandraStore struct {
-	Session          *gocql.Session
-	Cluster          *gocql.ClusterConfig
-	config           *StoreConfig
+	Session          *util.CassandraSession
+	cluster          *gocql.ClusterConfig
 	writeQueues      []chan *mdata.ChunkWriteRequest
 	writeQueueMeters []*stats.Range32
 	readQueue        chan *ChunkReadRequest
@@ -89,7 +88,6 @@ type CassandraStore struct {
 	tracer           opentracing.Tracer
 	shutdown         chan struct{}
 	wg               sync.WaitGroup
-	sessionLock      sync.RWMutex
 }
 
 // ConvertTimeout provides backwards compatibility for values that used to be specified as integers,
@@ -224,18 +222,22 @@ func NewCassandraStore(config *StoreConfig, ttls []uint32) (*CassandraStore, err
 	if err != nil {
 		return nil, err
 	}
-	log.Debugf("CS: created session with config %+v", config)
+
+	sd := make(chan struct{})
+
+	cs := util.NewCassandraSession(session, cluster, sd, config.ConnectionCheckTimeout, config.ConnectionCheckInterval, config.Addrs, "cassandra_store")
+
+	log.Debugf("cassandra_store: created session with config %+v", config)
 	c := &CassandraStore{
-		Session:          session,
-		Cluster:          cluster,
+		Session:          cs,
+		cluster:          cluster,
 		writeQueues:      make([]chan *mdata.ChunkWriteRequest, config.WriteConcurrency),
 		writeQueueMeters: make([]*stats.Range32, config.WriteConcurrency),
 		readQueue:        make(chan *ChunkReadRequest, config.ReadQueueSize),
 		omitReadTimeout:  ConvertTimeout(config.OmitReadTimeout, time.Second),
 		TTLTables:        ttlTables,
 		tracer:           opentracing.NoopTracer{},
-		shutdown:         make(chan struct{}),
-		config:           config,
+		shutdown:         sd,
 	}
 
 	for i := 0; i < config.WriteConcurrency; i++ {
@@ -250,10 +252,10 @@ func NewCassandraStore(config *StoreConfig, ttls []uint32) (*CassandraStore, err
 		go c.processReadQueue()
 	}
 
-	if c.config.ConnectionCheckInterval > 0 {
-		log.Infof("cassandra_store: dead connection check enabled with an interval of %v", c.config.ConnectionCheckInterval)
+	if config.ConnectionCheckInterval > 0 {
+		log.Infof("cassandra_store: dead connection check enabled with an interval of %v", config.ConnectionCheckInterval)
 		c.wg.Add(1)
-		go c.deadConnectionCheck()
+		go c.Session.DeadConnectionCheck(&c.wg)
 	}
 
 	return c, err
@@ -269,9 +271,8 @@ func NewCassandraStore(config *StoreConfig, ttls []uint32) (*CassandraStore, err
 //   so remember the TTL might have been up to twice as much
 func (c *CassandraStore) FindExistingTables(keyspace string) error {
 
-	c.sessionLock.RLock()
-	defer c.sessionLock.RUnlock()
-	meta, err := c.Session.KeyspaceMetadata(keyspace)
+	session := c.Session.CurrentSession()
+	meta, err := session.KeyspaceMetadata(keyspace)
 	if err != nil {
 		return err
 	}
@@ -313,77 +314,6 @@ func (c *CassandraStore) Add(cwr *mdata.ChunkWriteRequest) {
 	which := sum % len(c.writeQueues)
 	c.writeQueueMeters[which].Value(len(c.writeQueues[which]))
 	c.writeQueues[which] <- cwr
-}
-
-func (c *CassandraStore) deadConnectionCheck() {
-	defer c.wg.Done()
-
-	ticker := time.NewTicker(time.Second * 5)
-	var totaltime time.Duration
-	var err error
-	var oldSession *gocql.Session
-
-OUTER:
-	for {
-		// connection to cassandra has been down for longer than the configured timeout
-		if totaltime >= c.config.ConnectionCheckTimeout {
-			c.sessionLock.Lock()
-			for {
-				select {
-				case <-c.shutdown:
-					log.Info("cassandra_store: received shutdown, exiting deadConnectionCheck")
-					if c.Session != nil && !c.Session.Closed() {
-						c.Session.Close()
-					}
-					// make sure we unlock the sessionLock before returning
-					c.sessionLock.Unlock()
-					return
-				default:
-					log.Errorf("cassandra_store: creating new session to cassandra using hosts: %v", c.config.Addrs)
-					if c.Session != nil && !c.Session.Closed() && oldSession == nil {
-						oldSession = c.Session
-					}
-					c.Session, err = c.Cluster.CreateSession()
-					if err != nil {
-						log.Errorf("cassandra_store: error while attempting to recreate cassandra session. will retry after %v: %v", c.config.ConnectionCheckInterval.String(), err)
-						time.Sleep(c.config.ConnectionCheckInterval)
-						totaltime += c.config.ConnectionCheckInterval
-						// continue inner loop to attempt to reconnect
-						continue
-					}
-					c.sessionLock.Unlock()
-					log.Errorf("cassandra_store: reconnecting to cassandra took %v", (totaltime - c.config.ConnectionCheckTimeout).String())
-					totaltime = 0
-					if oldSession != nil {
-						oldSession.Close()
-						oldSession = nil
-					}
-					// we connected, so go back to the normal outer loop
-					continue OUTER
-				}
-			}
-		}
-
-		select {
-		case <-c.shutdown:
-			log.Info("cassandra_store: received shutdown, exiting deadConnectionCheck")
-			if c.Session != nil && !c.Session.Closed() {
-				c.Session.Close()
-			}
-			return
-		case <-ticker.C:
-			c.sessionLock.RLock()
-			// this query should work on all cassandra deployments, but we may need to revisit this
-			err = c.Session.Query("SELECT cql_version FROM system.local").Exec()
-			if err == nil {
-				totaltime = 0
-			} else {
-				totaltime += c.config.ConnectionCheckInterval
-				log.Errorf("cassandra_store: could not execute connection check query for %v: %v", totaltime.String(), err)
-			}
-			c.sessionLock.RUnlock()
-		}
-	}
 }
 
 /* process writeQueue.
@@ -488,10 +418,9 @@ func (c *CassandraStore) insertChunk(key string, t0, ttl uint32, data []byte) er
 
 	row_key := fmt.Sprintf("%s_%d", key, t0/Month_sec) // "month number" based on unix timestamp (rounded down)
 	pre := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), c.Cluster.Timeout)
-	c.sessionLock.RLock()
-	defer c.sessionLock.RUnlock()
-	ret := c.Session.Query(table.QueryWrite, row_key, t0, data, uint32(relativeTtl)).WithContext(ctx).Exec()
+	ctx, cancel := context.WithTimeout(context.Background(), c.cluster.Timeout)
+	session := c.Session.CurrentSession()
+	ret := session.Query(table.QueryWrite, row_key, t0, data, uint32(relativeTtl)).WithContext(ctx).Exec()
 	cancel()
 	cassPutExecDuration.Value(time.Now().Sub(pre))
 	return ret
@@ -524,10 +453,10 @@ func (c *CassandraStore) processReadQueue() {
 				continue
 			}
 
-			// the sessionLocks are handled in SearchTable
 			pre := time.Now()
+			session := c.Session.CurrentSession()
 			iter := readResult{
-				i:   c.Session.Query(crr.q, crr.p...).WithContext(crr.ctx).Iter(),
+				i:   session.Query(crr.q, crr.p...).WithContext(crr.ctx).Iter(),
 				err: nil,
 			}
 			cassGetExecDuration.Value(time.Since(pre))
@@ -610,9 +539,6 @@ func (c *CassandraStore) SearchTable(ctx context.Context, key schema.AMKey, tabl
 		out:       results,
 		ctx:       ctx,
 	}
-
-	c.sessionLock.RLock()
-	defer c.sessionLock.RUnlock()
 
 	select {
 	case <-ctx.Done():

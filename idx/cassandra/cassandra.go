@@ -61,12 +61,11 @@ type CasIdx struct {
 	memory.MemoryIndex
 	Config           *IdxConfig
 	cluster          *gocql.ClusterConfig
-	Session          *gocql.Session
+	Session          *util.CassandraSession
 	metaRecords      metaRecordStatusByOrg
 	writeQueue       chan writeReq
 	shutdown         chan struct{}
 	wg               sync.WaitGroup
-	sessionLock      sync.RWMutex
 	updateInterval32 uint32
 }
 
@@ -178,7 +177,7 @@ func (c *CasIdx) InitBare() error {
 		return fmt.Errorf("cassandra-idx: failed to create cassandra session: %s", err)
 	}
 
-	c.Session = session
+	c.Session = util.NewCassandraSession(session, c.cluster, c.shutdown, c.Config.ConnectionCheckTimeout, c.Config.ConnectionCheckInterval, c.Config.Hosts, "cassnadra-idx")
 
 	return nil
 }
@@ -258,9 +257,9 @@ func (c *CasIdx) Init() error {
 	}
 
 	if c.Config.ConnectionCheckInterval > 0 {
-		log.Infof("cassandra_store: dead connection check enabled with an interval of %v", c.Config.ConnectionCheckInterval)
+		log.Infof("cassandra-idx: dead connection check enabled with an interval of %v", c.Config.ConnectionCheckInterval)
 		c.wg.Add(1)
-		go c.deadConnectionCheck()
+		go c.Session.DeadConnectionCheck(&c.wg)
 	}
 
 	return nil
@@ -422,9 +421,8 @@ func (c *CasIdx) rebuildIndex() {
 }
 
 func (c *CasIdx) Load(defs []schema.MetricDefinition, now time.Time) []schema.MetricDefinition {
-	c.sessionLock.RLock()
-	defer c.sessionLock.RUnlock()
-	iter := c.Session.Query(fmt.Sprintf("SELECT id, orgid, partition, name, interval, unit, mtype, tags, lastupdate from %s", c.Config.Table)).Iter()
+	session := c.Session.CurrentSession()
+	iter := session.Query(fmt.Sprintf("SELECT id, orgid, partition, name, interval, unit, mtype, tags, lastupdate from %s", c.Config.Table)).Iter()
 	return c.load(defs, iter, now)
 }
 
@@ -436,9 +434,8 @@ func (c *CasIdx) LoadPartitions(partitions []int32, defs []schema.MetricDefiniti
 	}
 	q := fmt.Sprintf("SELECT id, orgid, partition, name, interval, unit, mtype, tags, lastupdate from %s where partition in (%s)", c.Config.Table, strings.Join(placeholders, ","))
 
-	c.sessionLock.RLock()
-	defer c.sessionLock.RUnlock()
-	iter := c.Session.Query(q).Iter()
+	session := c.Session.CurrentSession()
+	iter := session.Query(q).Iter()
 	return c.load(defs, iter, now)
 }
 
@@ -588,8 +585,8 @@ func (c *CasIdx) processWriteQueue() {
 					log.Info("cassandra-idx: received shutdown, exiting processWriteQueue")
 					return
 				default:
-					c.sessionLock.RLock()
-					if err := c.Session.Query(
+					session := c.Session.CurrentSession()
+					if err := session.Query(
 						qry,
 						req.def.Id.String(),
 						req.def.OrgId,
@@ -618,83 +615,11 @@ func (c *CasIdx) processWriteQueue() {
 						statQueryInsertOk.Inc()
 						log.Debugf("cassandra-idx: metricDef %s saved to cassandra", req.def.Id)
 					}
-					c.sessionLock.RUnlock()
 				}
 			}
 		case <-c.shutdown:
 			log.Info("cassandra-idx: received shutdown, exiting processWriteQueue")
 			return
-		}
-	}
-}
-
-func (c *CasIdx) deadConnectionCheck() {
-	defer c.wg.Done()
-
-	ticker := time.NewTicker(time.Second * 5)
-	var totaltime time.Duration
-	var err error
-	var oldSession *gocql.Session
-
-OUTER:
-	for {
-		// connection to cassandra has been down for longer than the configured timeout
-		if totaltime >= c.Config.ConnectionCheckTimeout {
-			c.sessionLock.Lock()
-			for {
-				select {
-				case <-c.shutdown:
-					log.Info("cassandra-idx: received shutdown, exiting deadConnectionCheck")
-					if c.Session != nil && !c.Session.Closed() {
-						c.Session.Close()
-					}
-					// make sure we unlock the sessionLock before returning
-					c.sessionLock.Unlock()
-					return
-				default:
-					log.Errorf("cassandra-idx: creating new session to cassandra using hosts: %v", c.Config.Hosts)
-					if c.Session != nil && !c.Session.Closed() && oldSession == nil {
-						oldSession = c.Session
-					}
-					c.Session, err = c.cluster.CreateSession()
-					if err != nil {
-						log.Errorf("cassandra-idx: error while attempting to recreate cassandra session. will retry after %v: %v", c.Config.ConnectionCheckInterval.String(), err)
-						time.Sleep(c.Config.ConnectionCheckInterval)
-						totaltime += c.Config.ConnectionCheckInterval
-						// continue inner loop to attempt to reconnect
-						continue
-					}
-					c.sessionLock.Unlock()
-					log.Errorf("cassandra-idx: reconnecting to cassandra took %v", (totaltime - c.Config.ConnectionCheckTimeout).String())
-					totaltime = 0
-					if oldSession != nil {
-						oldSession.Close()
-						oldSession = nil
-					}
-					// we connected, so go back to the normal outer loop
-					continue OUTER
-				}
-			}
-		}
-
-		select {
-		case <-c.shutdown:
-			log.Info("cassandra-idx: received shutdown, exiting deadConnectionCheck")
-			if c.Session != nil && !c.Session.Closed() {
-				c.Session.Close()
-			}
-			return
-		case <-ticker.C:
-			c.sessionLock.RLock()
-			// this query should work on all cassandra deployments, but we may need to revisit this
-			err = c.Session.Query("SELECT cql_version FROM system.local").Exec()
-			if err == nil {
-				totaltime = 0
-			} else {
-				totaltime += c.Config.ConnectionCheckInterval
-				log.Errorf("cassandra-idx: could not execute connection check query for %v: %v", totaltime.String(), err)
-			}
-			c.sessionLock.RUnlock()
 		}
 	}
 }
@@ -714,8 +639,8 @@ func (c *CasIdx) addDefToArchive(def schema.MetricDefinition) error {
 			time.Sleep(time.Duration(sleepTime) * time.Millisecond)
 		}
 
-		c.sessionLock.RLock()
-		err := c.Session.Query(
+		session := c.Session.CurrentSession()
+		err := session.Query(
 			insertQry,
 			def.Id.String(),
 			def.OrgId,
@@ -727,7 +652,6 @@ func (c *CasIdx) addDefToArchive(def schema.MetricDefinition) error {
 			def.Tags,
 			def.LastUpdate,
 			now).Exec()
-		c.sessionLock.RUnlock()
 
 		if err == nil {
 			return nil
@@ -766,9 +690,8 @@ func (c *CasIdx) deleteDef(key schema.MKey, part int32) error {
 	keyStr := key.String()
 	for attempts < 5 {
 		attempts++
-		c.sessionLock.RLock()
-		err := c.Session.Query(fmt.Sprintf("DELETE FROM %s where partition=? AND id=?", c.Config.Table), part, keyStr).Exec()
-		c.sessionLock.RUnlock()
+		session := c.Session.CurrentSession()
+		err := session.Query(fmt.Sprintf("DELETE FROM %s where partition=? AND id=?", c.Config.Table), part, keyStr).Exec()
 		if err != nil {
 			statQueryDeleteFail.Inc()
 			errmetrics.Inc(err)
